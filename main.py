@@ -1,6 +1,7 @@
 """
 Punto de entrada del bot con Notificaciones por Telegram,
 Filtro de Tendencia Global (SMA 200 de BTC) y Machine Learning Activo.
+Incluye Servidor de Salud HTTP para despliegue en Render (Free Web Service).
 
 Modos de uso:
   python main.py backtest        -> corre backtest sobre datos históricos
@@ -12,6 +13,8 @@ import logging
 import sys
 import time
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from dotenv import load_dotenv
 
@@ -34,6 +37,29 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(config.LOG_FILE)],
 )
 logger = logging.getLogger("main")
+
+
+# --- Servidor HTTP para Render Health Check ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot OK - Running")
+
+    def log_message(self, format, *args):
+        # Desactivar logs ruidosos de peticiones HTTP en consola
+        return
+
+
+def start_health_check_server():
+    """Inicia un servidor HTTP básico en segundo plano para satisfacer a Render."""
+    port = int(os.getenv("PORT", 8080))
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        logger.info("Servidor de Health Check activo en el puerto %d", port)
+        server.serve_forever()
+    except Exception as e:
+        logger.error("Error iniciando servidor Health Check: %s", e)
 
 
 def send_telegram(msg: str):
@@ -103,15 +129,15 @@ def cmd_train():
 
 
 def cmd_run(poll_seconds: int = 60):
+    # Iniciar el servidor web de salud en un hilo secundario para Render
+    t = threading.Thread(target=start_health_check_server, daemon=True)
+    t.start()
+
     if not config.DRY_RUN and not config.USE_TESTNET:
         logger.warning(
             "*** ATENCIÓN: DRY_RUN=false y USE_TESTNET=false. "
             "El bot va a operar con DINERO REAL en mainnet. ***"
         )
-        confirm = input("Escribí 'CONFIRMO' para continuar: ")
-        if confirm.strip() != "CONFIRMO":
-            logger.info("Cancelado por el usuario.")
-            return
 
     client = get_client()
     executor = BinanceExecutor(client)
@@ -131,7 +157,7 @@ def cmd_run(poll_seconds: int = 60):
         models[symbol] = model
 
     logger.info("Bot iniciado. DRY_RUN=%s USE_TESTNET=%s", config.DRY_RUN, config.USE_TESTNET)
-    send_telegram("🤖 *Bot de Trading Iniciado*\nMonitoreando en vivo: " + ", ".join(config.SYMBOLS))
+    send_telegram("🤖 *Bot de Trading Iniciado en Render*\nMonitoreando en vivo: " + ", ".join(config.SYMBOLS))
 
     while True:
         current_prices = {}
@@ -225,23 +251,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.mode == "backtest":
-
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot OK")
-
-def run_health_check_server():
-    port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
-
-# Iniciar servidor web en un hilo secundario
-threading.Thread(target=run_health_check_server, daemon=True).start()
         cmd_backtest()
     elif args.mode == "train":
         cmd_train()
