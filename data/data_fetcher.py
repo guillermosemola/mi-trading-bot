@@ -17,11 +17,13 @@ def get_client() -> Client:
     if config.USE_TESTNET:
         client = Client(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, testnet=True)
     else:
-        client = Client(
-            config.BINANCE_API_KEY, 
-            config.BINANCE_API_SECRET,
-            requests_params={"timeout": 10}
-        )
+       client = Client(
+    config.BINANCE_API_KEY,
+    config.BINANCE_API_SECRET,
+    requests_params={"timeout": 10}
+)
+# Redirigir llamadas de API a endpoints globales no bloqueados
+client.API_URL = 'https://api1.binance.com/api'
 
     # 1. Ampliar la ventana de recepción a 60 segundos
     client.RECV_WINDOW = 60000
