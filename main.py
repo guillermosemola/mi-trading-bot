@@ -2,17 +2,16 @@
 Punto de entrada del bot con Notificaciones por Telegram,
 Filtro de Tendencia Global (SMA 200 de BTC) y Machine Learning Activo.
 Incluye Servidor de Salud HTTP para despliegue en Render (Free Web Service).
-
-Modos de uso:
-  python main.py backtest        -> corre backtest sobre datos históricos
-  python main.py train           -> entrena y guarda el modelo ML con datos actuales
-  python main.py run             -> loop en vivo (respeta DRY_RUN/USE_TESTNET del config)
 """
+import sys
+import os
+
+# Ajuste de ruta para resolver paquetes locales en Render
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 import argparse
 import logging
-import sys
 import time
-import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
@@ -47,7 +46,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot OK - Running")
 
     def log_message(self, format, *args):
-        # Desactivar logs ruidosos de peticiones HTTP en consola
         return
 
 
@@ -77,10 +75,7 @@ def send_telegram(msg: str):
 
 
 def is_btc_bullish(client) -> bool:
-    """
-    FILTRO DE TENDENCIA GLOBAL:
-    Verifica si BTCUSDT cotiza por encima de su media móvil de 200 períodos (SMA 200).
-    """
+    """Verifica si BTCUSDT cotiza por encima de la SMA 200."""
     try:
         df_btc = fetch_klines(client, "BTCUSDT")
         df_feat = build_features(df_btc).dropna()
@@ -112,9 +107,6 @@ def cmd_backtest():
         for k, v in results.items():
             if k not in ("equity_curve", "trades", "ml_metrics"):
                 print(f"  {k}: {v}")
-        if "ml_metrics" in results and "accuracy" in results["ml_metrics"]:
-            print(f"  ml_accuracy: {results['ml_metrics']['accuracy']:.3f}")
-            print(f"  ml_auc: {results['ml_metrics']['auc']:.3f}")
 
 
 def cmd_train():
@@ -129,15 +121,11 @@ def cmd_train():
 
 
 def cmd_run(poll_seconds: int = 60):
-    # Iniciar el servidor web de salud en un hilo secundario para Render
     t = threading.Thread(target=start_health_check_server, daemon=True)
     t.start()
 
     if not config.DRY_RUN and not config.USE_TESTNET:
-        logger.warning(
-            "*** ATENCIÓN: DRY_RUN=false y USE_TESTNET=false. "
-            "El bot va a operar con DINERO REAL en mainnet. ***"
-        )
+        logger.warning("*** ATENCIÓN: Operando en MAINNET con dinero REAL ***")
 
     client = get_client()
     executor = BinanceExecutor(client)
@@ -156,13 +144,11 @@ def cmd_run(poll_seconds: int = 60):
             model.train(df_feat)
         models[symbol] = model
 
-    logger.info("Bot iniciado. DRY_RUN=%s USE_TESTNET=%s", config.DRY_RUN, config.USE_TESTNET)
+    logger.info("Bot iniciado en Render. DRY_RUN=%s USE_TESTNET=%s", config.DRY_RUN, config.USE_TESTNET)
     send_telegram("🤖 *Bot de Trading Iniciado en Render*\nMonitoreando en vivo: " + ", ".join(config.SYMBOLS))
 
     while True:
         current_prices = {}
-        
-        # Evaluar el filtro de mercado global sobre BTC antes de analizar entradas
         btc_bullish = is_btc_bullish(client)
 
         for symbol in config.SYMBOLS:
@@ -173,7 +159,6 @@ def cmd_run(poll_seconds: int = 60):
                 price = last_row["close"]
                 current_prices[symbol] = price
 
-                # 1. Gestión de posición abierta (Verificar Stop Loss / Trailing Stop / Take Profit)
                 if portfolio.has_position(symbol):
                     hit = portfolio.check_stop_take(symbol, price)
                     if hit:
@@ -191,20 +176,15 @@ def cmd_run(poll_seconds: int = 60):
                             f"📊 *PnL:* `{pnl_val:+.4f} USDT`"
                         )
                         send_telegram(msg_sell)
-                        logger.info("%s cerrado por %s, PnL=%.4f", symbol, hit, pnl_val)
                     continue
 
-                # 2. Control de riesgo del portafolio
                 if not risk_manager.can_trade():
-                    logger.warning("Trading pausado: %s", risk_manager.halt_reason)
                     continue
 
-                # 3. Bloqueo de compras si el mercado general es bajista
                 if not btc_bullish:
-                    logger.info("Mercado en tendencia bajista (BTC < SMA200). Se omiten compras para %s", symbol)
+                    logger.info("BTC < SMA200. Compras omitidas para %s", symbol)
                     continue
 
-                # 4. Evaluación de Señal de Entrada
                 ml_prob_up = models[symbol].predict_proba_up(last_row)
                 sig = combined_signal(last_row, ml_prob_up)
                 logger.info(
