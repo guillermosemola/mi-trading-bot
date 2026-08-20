@@ -1,0 +1,7 @@
+python-binance>=1.0.19
+pandas>=2.2.3
+numpy>=1.26.4
+scikit-learn>=1.5.0
+joblib>=1.4.2
+python-dotenv>=1.0.1
+ta>=0.11.0
