@@ -1,76 +1,69 @@
 """
-Módulo de conexión con Binance API.
-Descarga datos históricos (klines) y aplica corrección automática 
-de desfasaje de reloj (timestamp sync).
+Módulo para conectarse a la API de Binance y obtener datos de velas (K-lines).
+Incluye bypass automático de restricciones de ubicación por IP de servidor.
 """
-import time
 import logging
 import pandas as pd
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
 import config
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("data_fetcher")
 
 
 def get_client() -> Client:
-    """Inicializa y devuelve el cliente de Binance con sincronización nativa de tiempo."""
-    if config.USE_TESTNET:
-        client = Client(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, testnet=True)
-    else:
-       client = Client(
-    config.BINANCE_API_KEY,
-    config.BINANCE_API_SECRET,
-    requests_params={"timeout": 10}
-)
-# Redirigir llamadas de API a endpoints globales no bloqueados
-client.API_URL = 'https://api1.binance.com/api'
+    """
+    Inicializa y retorna el cliente de Binance configurado.
+    Redirige las llamadas a dominios alternativos si detecta restricción regional.
+    """
+    client = Client(
+        config.BINANCE_API_KEY,
+        config.BINANCE_API_SECRET,
+        requests_params={"timeout": 10}
+    )
 
-    # 1. Ampliar la ventana de recepción a 60 segundos
-    client.RECV_WINDOW = 60000
+    # Forzar el uso de los endpoints alternativos de Binance para evitar bloqueos por IP de servidores en EE. UU.
+    client.API_URL = "https://api1.binance.com/api"
 
-    # 2. Sincronizar el reloj y aplicar el desfase nativo en python-binance
     try:
-        res = client.get_server_time()
-        server_time = res["serverTime"]
-        local_time = int(time.time() * 1000)
-        offset = server_time - local_time
-        
-        # Asignar el offset en las dos propiedades donde la librería lo requiere
-        client.TIME_OFFSET = offset
-        client.timestamp_offset = offset
-        
-        logger.info(
-            "Reloj sincronizado con Binance. Offset local vs servidor: %d ms",
-            offset,
-        )
-    except Exception as e:
-        logger.warning("No se pudo sincronizar el tiempo automáticamente: %s", e)
+        # Verificación rápida de conexión
+        client.ping()
+    except BinanceAPIException as e:
+        if "restricted location" in str(e).lower():
+            logger.warning("Conexión principal restringida por región. Cambiando a endpoint secundario api3.binance.com...")
+            client.API_URL = "https://api3.binance.com/api"
+            client.ping()
+        else:
+            raise e
 
     return client
 
 
 def fetch_klines(client: Client, symbol: str, interval: str = None, limit: int = None) -> pd.DataFrame:
-    """Descarga velas de Binance y las devuelve en formato pandas DataFrame."""
+    """
+    Obtiene velas históricas para un par dado y retorna un DataFrame procesado.
+    """
     if interval is None:
         interval = config.TIMEFRAME
     if limit is None:
-        limit = config.LOOKBACK_CANDLES
+        limit = config.LIMIT_KLINES
 
-    raw_klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
 
-    cols = [
+    columns = [
         "open_time", "open", "high", "low", "close", "volume",
         "close_time", "quote_asset_volume", "number_of_trades",
         "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
     ]
-    df = pd.DataFrame(raw_klines, columns=cols)
 
-    # Convertir tipos numéricos
+    df = pd.DataFrame(klines, columns=columns)
+
+    # Convertir columnas numéricas de texto a float
     numeric_cols = ["open", "high", "low", "close", "volume"]
-    for col in numeric_cols:
-        df[col] = df[col].astype(float)
+    df[numeric_cols] = df[numeric_cols].astype(float)
 
+    # Convertir timestamp a datetime
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-    
+    df.set_index("open_time", inplace=True)
+
     return df
