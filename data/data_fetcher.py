@@ -1,6 +1,6 @@
 """
 Módulo para conectarse a la API de Binance y obtener datos de velas (K-lines).
-Incluye bypass automático de restricciones de ubicación por IP de servidor.
+Incluye bypass automático de restricciones y valores de respaldo para config.
 """
 import logging
 import pandas as pd
@@ -22,15 +22,14 @@ def get_client() -> Client:
         requests_params={"timeout": 10}
     )
 
-    # Forzar el uso de los endpoints alternativos de Binance para evitar bloqueos por IP de servidores en EE. UU.
+    # Forzar el uso de los endpoints alternativos de Binance para evitar bloqueos por IP
     client.API_URL = "https://api1.binance.com/api"
 
     try:
-        # Verificación rápida de conexión
         client.ping()
     except BinanceAPIException as e:
         if "restricted location" in str(e).lower():
-            logger.warning("Conexión principal restringida por región. Cambiando a endpoint secundario api3.binance.com...")
+            logger.warning("Conexión principal restringida. Cambiando a api3.binance.com...")
             client.API_URL = "https://api3.binance.com/api"
             client.ping()
         else:
@@ -44,9 +43,11 @@ def fetch_klines(client: Client, symbol: str, interval: str = None, limit: int =
     Obtiene velas históricas para un par dado y retorna un DataFrame procesado.
     """
     if interval is None:
-        interval = config.TIMEFRAME
+        interval = getattr(config, "TIMEFRAME", "1h")
+    
+    # Manejo seguro para evitar el AttributeError si LIMIT_KLINES no existe en config.py
     if limit is None:
-        limit = config.LIMIT_KLINES
+        limit = getattr(config, "LIMIT_KLINES", getattr(config, "KLINES_LIMIT", 500))
 
     klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
 
@@ -58,7 +59,7 @@ def fetch_klines(client: Client, symbol: str, interval: str = None, limit: int =
 
     df = pd.DataFrame(klines, columns=columns)
 
-    # Convertir columnas numéricas de texto a float
+    # Convertir columnas numéricas a float
     numeric_cols = ["open", "high", "low", "close", "volume"]
     df[numeric_cols] = df[numeric_cols].astype(float)
 
