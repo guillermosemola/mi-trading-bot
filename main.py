@@ -1,7 +1,7 @@
 """
 Módulo Principal del Bot de Trading (main.py)
 Coordina la recolección de datos, generación de señales mediante ensamble,
-gestión dinámica de posiciones, Trailing Stop, Break-Even y alertas de Telegram.
+gestión dinámica de posiciones, ejecución adaptativa de órdenes y alertas de Telegram.
 """
 import logging
 import time
@@ -11,6 +11,7 @@ import numpy as np
 import config
 from strategies import trend_following, mean_reversion
 from risk.risk_manager import RiskManager
+from execution.order_manager import OrderManager
 from notifications.telegram_bot import send_telegram_message
 
 # Configuración del registrador de eventos (Logging)
@@ -23,20 +24,24 @@ logger = logging.getLogger("TradingBot")
 
 
 class TradingBot:
-    def __init__(self):
-        # Inicializamos el gestor de riesgo
-        self.risk_manager = RiskManager(sl_atr_mult=1.8, tp_atr_mult=3.6)
-        self.active_position = None  # Almacena la posición abierta
+    def __init__(self, client=None):
+        self.client = client
         self.symbol = getattr(config, "SYMBOL", "BTCUSDT")
+        
+        # Inicialización del Gestor de Riesgo y Gestor de Órdenes
+        self.risk_manager = RiskManager(sl_atr_mult=1.8, tp_atr_mult=3.6)
+        self.order_manager = OrderManager(client=self.client)
+        self.active_position = None  # Almacena la posición abierta
         
         # Pesos para el Ensamble de Estrategias
         self.weight_trend = 0.6
         self.weight_reversion = 0.4
         self.entry_threshold = getattr(config, "ENTRY_THRESHOLD", 0.55)
 
-        # Enviar notificación inicial a Telegram al arrancar
+        # Notificación inicial a Telegram
+        dry_run_str = " (DRY RUN / SIMULACIÓN)" if self.order_manager.dry_run else " (LIVE / REAL)"
         send_telegram_message(
-            f"🤖 *Bot de Trading Iniciado*\n"
+            f"🤖 *Bot de Trading Iniciado*{dry_run_str}\n"
             f"• *Símbolo:* `{self.symbol}`\n"
             f"• *Capital Inicial:* `{self.risk_manager.current_equity:.2f} USDT`"
         )
@@ -59,7 +64,7 @@ class TradingBot:
             self._manage_open_position(current_price, current_atr)
             return
 
-        # 2. SI NO HAY POSICIÓN: Verificar Circuit Breakers antes de buscar entradas
+        # 2. SI NO HAY POSICIÓN: Verificar Circuit Breakers del Gestor de Riesgo
         if not self.risk_manager.can_trade():
             msg = f"⚠️ *Trading Pausado por Gestor de Riesgo*\nMotivo: {self.risk_manager.halt_reason}"
             logger.warning(msg)
@@ -77,46 +82,66 @@ class TradingBot:
             self._open_position(side="SHORT", entry_price=current_price, atr=current_atr)
 
     def _open_position(self, side: str, entry_price: float, atr: float):
-        """Calcula el tamaño, niveles de riesgo, abre la posición y notifica a Telegram."""
+        """Calcula el tamaño, ejecuta la orden de entrada y establece niveles de riesgo."""
         sl_price = self.risk_manager.stop_loss_price(entry_price, side, atr)
-        tp_price = self.risk_manager.take_profit_price(entry_price, side, atr)
-        qty = self.risk_manager.position_size(entry_price, sl_price)
-        notional_usdt = qty * entry_price
+        raw_qty = self.risk_manager.position_size(entry_price, sl_price)
+
+        # Precios estimados de Spread Bid/Ask
+        bid_price = entry_price * 0.9999
+        ask_price = entry_price * 1.0001
+
+        # Ejecución inteligente vía OrderManager
+        execution = self.order_manager.execute_smart_order(
+            symbol=self.symbol,
+            side=side,
+            qty=raw_qty,
+            current_bid=bid_price,
+            current_ask=ask_price
+        )
+
+        if execution["status"] != "FILLED":
+            logger.warning("No se pudo ejecutar la orden de entrada.")
+            return
+
+        real_entry_price = execution["filled_price"]
+        actual_qty = execution["qty"]
+        tp_price = self.risk_manager.take_profit_price(real_entry_price, side, atr)
+        notional_usdt = actual_qty * real_entry_price
 
         self.active_position = {
             "symbol": self.symbol,
             "side": side,
-            "entry_price": entry_price,
-            "qty": qty,
+            "entry_price": real_entry_price,
+            "qty": actual_qty,
             "stop_loss": sl_price,
             "take_profit": tp_price,
-            "best_price": entry_price  # Necesario para el Trailing Stop
+            "best_price": real_entry_price
         }
 
         logger.info(
             f"=== POSICIÓN ABIERTA [{side}] ==="
-            f"\n  Precio Entrada: {entry_price:.2f}"
-            f"\n  Cantidad: {qty:.4f}"
-            f"\n  Stop Loss Inicial: {sl_price:.2f}"
-            f"\n  Take Profit Inicial: {tp_price:.2f}"
+            f"\n  Precio Ejecutado: {real_entry_price:.2f}"
+            f"\n  Cantidad: {actual_qty:.4f}"
+            f"\n  Tipo Orden: {execution['type']}"
+            f"\n  Stop Loss: {sl_price:.2f}"
+            f"\n  Take Profit: {tp_price:.2f}"
         )
 
-        # Enviar alerta a Telegram
         emoji = "🟢" if side == "LONG" else "🔴"
         send_telegram_message(
             f"{emoji} *NUEVA POSICIÓN ABIERTA [{side}]*\n\n"
             f"• *Activo:* `{self.symbol}`\n"
-            f"• *Precio Entrada:* `{entry_price:.2f} USDT`\n"
-            f"• *Cantidad:* `{qty:.4f}` (~`{notional_usdt:.2f} USDT`)\n"
+            f"• *Precio Entrada:* `{real_entry_price:.2f} USDT`\n"
+            f"• *Cantidad:* `{actual_qty:.4f}` (~`{notional_usdt:.2f} USDT`)\n"
+            f"• *Tipo:* `{execution['type']}`\n"
             f"• *Stop Loss:* `{sl_price:.2f} USDT`\n"
             f"• *Take Profit:* `{tp_price:.2f} USDT`"
         )
 
     def _manage_open_position(self, current_price: float, current_atr: float):
-        """Ajusta el Stop Loss dinámicamente y verifica condiciones de salida."""
+        """Ajusta Stop Loss dinámico y comprueba condiciones de salida."""
         pos = self.active_position
 
-        # Actualizar Stop Loss dinámico (Break-Even / Trailing Stop)
         new_sl, new_best = self.risk_manager.update_dynamic_stop(
             side=pos["side"],
             entry_price=pos["entry_price"],
@@ -129,10 +154,10 @@ class TradingBot:
         pos["best_price"] = new_best
 
         if new_sl != pos["stop_loss"]:
-            logger.info(f"Stop Loss actualizado dinámicamente: {pos['stop_loss']:.2f} -> {new_sl:.2f}")
+            logger.info(f"Stop Loss actualizado: {pos['stop_loss']:.2f} -> {new_sl:.2f}")
             pos["stop_loss"] = new_sl
 
-        # Comprobar condiciones de salida
+        # Comprobar salidas para LONG y SHORT
         if pos["side"] == "LONG":
             if current_price <= pos["stop_loss"]:
                 self._close_position(current_price, reason="STOP_LOSS / TRAILING_STOP")
@@ -145,9 +170,26 @@ class TradingBot:
             elif current_price <= pos["take_profit"]:
                 self._close_position(current_price, reason="TAKE_PROFIT")
 
-    def _close_position(self, exit_price: float, reason: str):
-        """Cierra la posición activa, registra PnL y envía reporte a Telegram."""
+    def _close_position(self, market_price: float, reason: str):
+        """Ejecuta la orden de cierre en Binance, registra PnL y envía alerta."""
         pos = self.active_position
+        close_side = "SELL" if pos["side"] == "LONG" else "BUY"
+
+        bid_price = market_price * 0.9999
+        ask_price = market_price * 1.0001
+
+        # Ejecutar cierre vía OrderManager
+        execution = self.order_manager.execute_smart_order(
+            symbol=pos["symbol"],
+            side=close_side,
+            qty=pos["qty"],
+            current_bid=bid_price,
+            current_ask=ask_price
+        )
+
+        exit_price = execution["filled_price"] if execution["status"] == "FILLED" else market_price
+
+        # Cálculo de PnL
         if pos["side"] == "LONG":
             pnl = (exit_price - pos["entry_price"]) * pos["qty"]
         else:
@@ -155,7 +197,7 @@ class TradingBot:
 
         pnl_pct = (pnl / (pos["entry_price"] * pos["qty"])) * 100
 
-        # Registrar PnL en el gestor de riesgo
+        # Registro en el gestor de riesgo
         self.risk_manager.register_trade_pnl(pnl)
         self.risk_manager.update_equity(self.risk_manager.current_equity + pnl)
 
@@ -166,7 +208,6 @@ class TradingBot:
             f"\n  Equidad Actual: {self.risk_manager.current_equity:.2f} USDT"
         )
 
-        # Enviar reporte detallado de resultado a Telegram
         outcome_emoji = "✅" if pnl >= 0 else "❌"
         send_telegram_message(
             f"{outcome_emoji} *POSICIÓN CERRADA [{reason}]*\n\n"
@@ -180,7 +221,6 @@ class TradingBot:
         self.active_position = None
 
 
-# --- EJEMPLO DE BUCLE DE SIMULACIÓN / RUNNER ---
 if __name__ == "__main__":
     bot = TradingBot()
     logger.info("Bot de Trading iniciado correctamente.")
