@@ -5,7 +5,8 @@ import logging
 import pandas as pd
 import config
 from notifications.telegram_bot import send_telegram_message
-from risk_management.risk_manager import RiskManager
+# CORRECTO:
+from risk.risk_manager import RiskManager
 from execution.order_manager import OrderManager
 
 logger = logging.getLogger(__name__)
