@@ -1,238 +1,153 @@
 """
-Punto de entrada del bot con Notificaciones por Telegram,
-Filtro de Tendencia Global (SMA 200 de BTC) y Machine Learning Activo.
-Incluye Servidor de Salud HTTP para despliegue en Render (Free Web Service).
+Módulo Principal del Bot de Trading (main.py)
+Coordina la recolección de datos, generación de señales mediante ensamble,
+y la gestión dinámica de posiciones y riesgo con Trailing Stop y Break-Even.
 """
-import sys
-import os
-
-# Ajuste de ruta para resolver paquetes locales en Render
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-import argparse
 import logging
 import time
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import requests
-from dotenv import load_dotenv
-
-# Cargar variables del archivo .env al entorno de Python
-load_dotenv()
+import pandas as pd
+import numpy as np
 
 import config
-from data.data_fetcher import get_client, fetch_klines
-from features.feature_engineering import build_features
-from models.ml_model import MLSignalModel
-from strategies.ensemble import combined_signal
+from strategies import trend_following, mean_reversion
 from risk.risk_manager import RiskManager
-from portfolio.portfolio_manager import PortfolioManager
-from execution.binance_executor import BinanceExecutor
-from backtest.backtester import run_backtest
 
+# Configuración del registrador de eventos (Logging)
 logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(config.LOG_FILE)],
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger("main")
+logger = logging.getLogger("TradingBot")
 
 
-# --- Servidor HTTP para Render Health Check ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot OK - Running")
+class TradingBot:
+    def __init__(self):
+        # Inicializamos el gestor de riesgo
+        self.risk_manager = RiskManager(sl_atr_mult=1.8, tp_atr_mult=3.6)
+        self.active_position = None  # Almacena la posición abierta
+        self.symbol = getattr(config, "SYMBOL", "BTCUSDT")
+        
+        # Pesos para el Ensamble de Estrategias
+        self.weight_trend = 0.6
+        self.weight_reversion = 0.4
+        self.entry_threshold = getattr(config, "ENTRY_THRESHOLD", 0.55)
 
-    def log_message(self, format, *args):
-        return
+    def calculate_ensemble_signal(self, row: pd.Series) -> float:
+        """Calcula la señal combinada ponderada de las estrategias."""
+        sig_trend = trend_following.signal(row)
+        sig_reversion = mean_reversion.signal(row)
 
+        combined_score = (sig_trend * self.weight_trend) + (sig_reversion * self.weight_reversion)
+        return float(np.clip(combined_score, -1.0, 1.0))
 
-def start_health_check_server():
-    """Inicia un servidor HTTP básico en segundo plano para satisfacer a Render."""
-    port = int(os.getenv("PORT", 8080))
-    try:
-        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-        logger.info("Servidor de Health Check activo en el puerto %d", port)
-        server.serve_forever()
-    except Exception as e:
-        logger.error("Error iniciando servidor Health Check: %s", e)
+    def evaluate_market(self, current_row: pd.Series):
+        """Evalúa las condiciones del mercado y gestiona entradas o salidas."""
+        current_price = float(current_row["close"])
+        current_atr = float(current_row.get("atr", current_price * 0.01))
 
+        # 1. SI HAY UNA POSICIÓN ABIERTA: Gestionar Trailing Stop, Break-Even y Cierres
+        if self.active_position is not None:
+            self._manage_open_position(current_price, current_atr)
+            return
 
-def send_telegram(msg: str):
-    """Envía un mensaje a Telegram si el token y chat_id están configurados."""
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-    if not bot_token or not chat_id:
-        return
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        logger.error("Error enviando notificación a Telegram: %s", e)
+        # 2. SI NO HAY POSICIÓN: Verificar Circuit Breakers antes de buscar entradas
+        if not self.risk_manager.can_trade():
+            logger.warning(f"Trading pausado por Gestor de Riesgo: {self.risk_manager.halt_reason}")
+            return
 
+        # 3. Calcular la Señal del Ensamble
+        ensemble_score = self.calculate_ensemble_signal(current_row)
+        logger.info(f"Precio: {current_price:.2f} | Ensamble Score: {ensemble_score:.3f}")
 
-def is_btc_bullish(client) -> bool:
-    """Verifica si BTCUSDT cotiza por encima de la SMA 200."""
-    try:
-        df_btc = fetch_klines(client, "BTCUSDT")
-        df_feat = build_features(df_btc).dropna()
-        if len(df_feat) < 200:
-            logger.warning("Velas insuficientes para SMA 200 de BTC. Permitiendo operaciones por defecto.")
-            return True
+        # 4. Evaluar Umbrales de Entrada
+        if ensemble_score >= self.entry_threshold:
+            self._open_position(side="LONG", entry_price=current_price, atr=current_atr)
+        elif ensemble_score <= -self.entry_threshold:
+            self._open_position(side="SHORT", entry_price=current_price, atr=current_atr)
 
-        sma200 = df_feat["close"].rolling(window=200).mean().iloc[-1]
-        btc_price = df_feat["close"].iloc[-1]
-        is_bull = btc_price > sma200
-        logger.info("Filtro BTC SMA 200: Precio=%.2f | SMA200=%.2f | Alcista=%s", btc_price, sma200, is_bull)
-        return is_bull
-    except Exception as e:
-        logger.error("Error calculando SMA 200 de BTC: %s", e)
-        return True
+    def _open_position(self, side: str, entry_price: float, atr: float):
+        """Calcula el tamaño, niveles de riesgo y abre la posición."""
+        sl_price = self.risk_manager.stop_loss_price(entry_price, side, atr)
+        tp_price = self.risk_manager.take_profit_price(entry_price, side, atr)
+        qty = self.risk_manager.position_size(entry_price, sl_price)
 
+        self.active_position = {
+            "symbol": self.symbol,
+            "side": side,
+            "entry_price": entry_price,
+            "qty": qty,
+            "stop_loss": sl_price,
+            "take_profit": tp_price,
+            "best_price": entry_price  # Necesario para el Trailing Stop
+        }
 
-def cmd_backtest():
-    client = get_client()
-    for symbol in config.SYMBOLS:
-        logger.info("=== Backtest: %s ===", symbol)
-        df = fetch_klines(client, symbol)
-        try:
-            results = run_backtest(df)
-        except ValueError as e:
-            logger.error(str(e))
-            continue
-        print(f"\n--- Resultados {symbol} ---")
-        for k, v in results.items():
-            if k not in ("equity_curve", "trades", "ml_metrics"):
-                print(f"  {k}: {v}")
+        logger.info(
+            f"=== POSICIÓN ABIERTA [{side}] ==="
+            f"\n  Precio Entrada: {entry_price:.2f}"
+            f"\n  Cantidad: {qty:.4f}"
+            f"\n  Stop Loss Inicial: {sl_price:.2f}"
+            f"\n  Take Profit Inicial: {tp_price:.2f}"
+        )
 
+    def _manage_open_position(self, current_price: float, current_atr: float):
+        """Ajusta el Stop Loss dinámicamente y verifica condiciones de salida."""
+        pos = self.active_position
 
-def cmd_train():
-    client = get_client()
-    for symbol in config.SYMBOLS:
-        logger.info("Entrenando modelo para %s", symbol)
-        df = fetch_klines(client, symbol)
-        df_feat = build_features(df).dropna()
-        model = MLSignalModel(model_path=f"models/artifacts/ml_model_{symbol}.joblib")
-        metrics = model.train(df_feat)
-        logger.info("%s -> accuracy=%.3f auc=%.3f", symbol, metrics["accuracy"], metrics["auc"])
+        # Actualizar Stop Loss dinámico (Break-Even / Trailing Stop)
+        new_sl, new_best = self.risk_manager.update_dynamic_stop(
+            side=pos["side"],
+            entry_price=pos["entry_price"],
+            current_price=current_price,
+            current_sl=pos["stop_loss"],
+            best_price=pos["best_price"],
+            atr=current_atr
+        )
 
+        pos["best_price"] = new_best
 
-def cmd_run(poll_seconds: int = 60):
-    t = threading.Thread(target=start_health_check_server, daemon=True)
-    t.start()
+        if new_sl != pos["stop_loss"]:
+            logger.info(f" Stop Loss actualizado dinámicamente: {pos['stop_loss']:.2f} -> {new_sl:.2f}")
+            pos["stop_loss"] = new_sl
 
-    if not config.DRY_RUN and not config.USE_TESTNET:
-        logger.warning("*** ATENCIÓN: Operando en MAINNET con dinero REAL ***")
+        # Comprobar condiciones de salida
+        if pos["side"] == "LONG":
+            if current_price <= pos["stop_loss"]:
+                self._close_position(current_price, reason="STOP_LOSS / TRAILING_STOP")
+            elif current_price >= pos["take_profit"]:
+                self._close_position(current_price, reason="TAKE_PROFIT")
 
-    client = get_client()
-    executor = BinanceExecutor(client)
-    portfolio = PortfolioManager(client=client)
-    risk_manager = RiskManager()
+        elif pos["side"] == "SHORT":
+            if current_price >= pos["stop_loss"]:
+                self._close_position(current_price, reason="STOP_LOSS / TRAILING_STOP")
+            elif current_price <= pos["take_profit"]:
+                self._close_position(current_price, reason="TAKE_PROFIT")
 
-    models = {}
-    for symbol in config.SYMBOLS:
-        model = MLSignalModel(model_path=f"models/artifacts/ml_model_{symbol}.joblib")
-        try:
-            model.load()
-        except FileNotFoundError:
-            logger.warning("No hay modelo entrenado para %s, entrenando ahora...", symbol)
-            df = fetch_klines(client, symbol)
-            df_feat = build_features(df).dropna()
-            model.train(df_feat)
-        models[symbol] = model
+    def _close_position(self, exit_price: float, reason: str):
+        """Cierra la posición activa y registra el resultado PnL."""
+        pos = self.active_position
+        if pos["side"] == "LONG":
+            pnl = (exit_price - pos["entry_price"]) * pos["qty"]
+        else:
+            pnl = (pos["entry_price"] - exit_price) * pos["qty"]
 
-    logger.info("Bot iniciado en Render. DRY_RUN=%s USE_TESTNET=%s", config.DRY_RUN, config.USE_TESTNET)
-    send_telegram("🤖 *Bot de Trading Iniciado en Render*\nMonitoreando en vivo: " + ", ".join(config.SYMBOLS))
+        # Registrar PnL en el gestor de riesgo
+        self.risk_manager.register_trade_pnl(pnl)
+        self.risk_manager.update_equity(self.risk_manager.current_equity + pnl)
 
-    while True:
-        current_prices = {}
-        btc_bullish = is_btc_bullish(client)
+        logger.info(
+            f"=== POSICIÓN CERRADA [{reason}] ==="
+            f"\n  Precio Salida: {exit_price:.2f}"
+            f"\n  PnL Operación: {pnl:+.2f} USDT"
+            f"\n  Equidad Actual: {self.risk_manager.current_equity:.2f} USDT"
+        )
 
-        for symbol in config.SYMBOLS:
-            try:
-                df = fetch_klines(client, symbol)
-                df_feat = build_features(df).dropna()
-                last_row = df_feat.iloc[-1]
-                price = last_row["close"]
-                current_prices[symbol] = price
-
-                if portfolio.has_position(symbol):
-                    hit = portfolio.check_stop_take(symbol, price)
-                    if hit:
-                        pos_qty = portfolio.positions.get(symbol, {}).get("quantity", 0)
-                        pnl = portfolio.close_position(symbol, price)
-                        executor.market_sell(symbol, pos_qty)
-                        pnl_val = pnl or 0.0
-                        risk_manager.register_trade_pnl(pnl_val)
-                        
-                        emoji = "🟢" if pnl_val >= 0 else "🔴"
-                        msg_sell = (
-                            f"{emoji} *OPERACIÓN CERRADA ({hit})*\n"
-                            f"📌 *Par:* `{symbol}`\n"
-                            f"💵 *Precio Salida:* `{price:.2f} USDT`\n"
-                            f"📊 *PnL:* `{pnl_val:+.4f} USDT`"
-                        )
-                        send_telegram(msg_sell)
-                    continue
-
-                if not risk_manager.can_trade():
-                    continue
-
-                if not btc_bullish:
-                    logger.info("BTC < SMA200. Compras omitidas para %s", symbol)
-                    continue
-
-                ml_prob_up = models[symbol].predict_proba_up(last_row)
-                sig = combined_signal(last_row, ml_prob_up)
-                logger.info(
-                    "%s señal=%s score=%.3f (trend=%.2f mr=%.2f ml=%.2f)",
-                    symbol, sig["decision"], sig["combined_score"],
-                    sig["trend_score"], sig["mean_reversion_score"], sig["ml_score"]
-                )
-
-                if sig["decision"] == "LONG":
-                    atr_val = last_row.get("atr", None)
-                    sl = risk_manager.stop_loss_price(price, "LONG", atr_val)
-                    tp = risk_manager.take_profit_price(price, "LONG", atr_val)
-                    qty = risk_manager.position_size(price, sl)
-                    
-                    if qty > 0:
-                        order = executor.market_buy(symbol, qty)
-                        if order:
-                            portfolio.open_position(symbol, price, qty, sl, tp)
-                            
-                            msg_buy = (
-                                f"🚀 *COMPRA EJECUTADA*\n"
-                                f"📌 *Par:* `{symbol}`\n"
-                                f"💵 *Precio Entrada:* `{price:.2f} USDT`\n"
-                                f"📦 *Cantidad:* `{qty}`\n"
-                                f"🔴 *Stop Loss:* `{sl:.2f} USDT`\n"
-                                f"🟢 *Take Profit:* `{tp:.2f} USDT`"
-                            )
-                            send_telegram(msg_buy)
-
-            except Exception as e:
-                logger.error("Error procesando %s: %s", symbol, e, exc_info=True)
-
-        equity = portfolio.total_equity(current_prices)
-        risk_manager.update_equity(equity)
-        logger.info("Equity actual: %.2f USDT", equity)
-
-        time.sleep(poll_seconds)
+        self.active_position = None
 
 
+# --- EJEMPLO DE BUCLE DE SIMULACIÓN / RUNNER ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Bot de trading multi-estrategia con ML")
-    parser.add_argument("mode", choices=["backtest", "train", "run"])
-    parser.add_argument("--poll-seconds", type=int, default=60)
-    args = parser.parse_args()
-
-    if args.mode == "backtest":
-        cmd_backtest()
-    elif args.mode == "train":
-        cmd_train()
-    elif args.mode == "run":
-        cmd_run(args.poll_seconds)
+    bot = TradingBot()
+    logger.info("Bot de Trading iniciado correctamente.")
+    
+    # En producción aquí se conecta el websocket de Binance o el loop de velas.
