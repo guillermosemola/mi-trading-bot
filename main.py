@@ -124,13 +124,13 @@ class TradingBot:
         if not pos:
             return
 
-        # Ejemplo de cierre por Stop Loss
+        # 1. Chequeo de Stop Loss
         if (pos["side"] == "LONG" and current_price <= pos["stop_loss"]) or \
            (pos["side"] == "SHORT" and current_price >= pos["stop_loss"]):
             send_telegram_message(f"🛑 *STOP LOSS ACTIVADO en {symbol}* @ `{current_price:.2f} USDT`")
             self.active_positions[symbol] = None
 
-        # Ejemplo de cierre por Take Profit
+        # 2. Chequeo de Take Profit
         elif (pos["side"] == "LONG" and current_price >= pos["take_profit"]) or \
              (pos["side"] == "SHORT" and current_price <= pos["take_profit"]):
             send_telegram_message(f"🎯 *TAKE PROFIT ALCANZADO en {symbol}* @ `{current_price:.2f} USDT`")
