@@ -67,10 +67,40 @@ class TradingBot:
             self._open_position(symbol=symbol, side="SHORT", entry_price=current_price, atr=current_atr)
 
     def calculate_ensemble_signal(self, current_row: pd.Series) -> float:
-        """Aquí se combinan las señales de tu ensamble de estrategias."""
-        # Coloca aquí la llamada a tus estrategias existentes (ej. trend_following + mean_reversion)
-        # Retorna un float entre -1.0 y 1.0
-        return 0.0  # Placeholder
+        """
+        Combina indicadores técnicos para generar una señal de -1.0 (Venta Fuerte) a 1.0 (Compra Fuerte).
+        """
+        score = 0.0
+
+        # 1. Extraer los valores calculados en la vela actual
+        # (Asegúrate de que indicators/technical.py genere estas columnas)
+        rsi = float(current_row.get("rsi", 50.0))
+        ema_fast = float(current_row.get("ema_fast", 0.0))
+        ema_slow = float(current_row.get("ema_slow", 0.0))
+
+        # 2. Estrategia 1: Tendencia (Cruce de EMAs)
+        trend_score = 0.0
+        if ema_fast > ema_slow and ema_slow > 0:
+            trend_score = 1.0   # Tendencia alcista
+        elif ema_fast < ema_slow and ema_slow > 0:
+            trend_score = -1.0  # Tendencia bajista
+
+        # 3. Estrategia 2: Reversión a la media (RSI)
+        reversion_score = 0.0
+        if rsi < 30:
+            reversion_score = 1.0   # Sobreventa extremo (señal de rebote alcista)
+        elif rsi > 70:
+            reversion_score = -1.0  # Sobrecompra extremo (señal de corrección bajista)
+
+        # 4. Obtener los pesos desde la configuración (config.py)
+        # Si no existen en config.py, usa 0.65 y 0.35 por defecto
+        weight_trend = getattr(config, "WEIGHT_TREND", 0.65)
+        weight_reversion = getattr(config, "WEIGHT_MEAN_REVERSION", 0.35)
+
+        # 5. Cálculo del Score Final ponderado
+        score = (trend_score * weight_trend) + (reversion_score * weight_reversion)
+
+        return score
 
     def _open_position(self, symbol: str, side: str, entry_price: float, atr: float):
         """Abre la posición y actualiza el diccionario del activo correspondiente."""
