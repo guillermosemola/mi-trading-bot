@@ -1,4 +1,3 @@
-"""
 Core Principal del Bot de Trading (main.py).
 """
 import logging
@@ -8,6 +7,7 @@ from notifications.telegram_bot import send_telegram_message
 # CORRECTO:
 from risk.risk_manager import RiskManager
 from execution.order_manager import OrderManager
+from strategies.ensemble import combined_signal
 
 logger = logging.getLogger(__name__)
 
@@ -56,51 +56,33 @@ class TradingBot:
             send_telegram_message(msg)
             return
 
-        # 3. Señal de la estrategia
-        ensemble_score = self.calculate_ensemble_signal(current_row)
-        logger.info(f"[{symbol}] Precio: {current_price:.2f} | Score: {ensemble_score:.3f}")
+        # 3. Señal de la estrategia (ensemble completo: tendencia + reversión +
+        #    filtro de régimen por ADX + slot ML). Ver strategies/ensemble.py
+        signal = self.calculate_ensemble_signal(current_row)
+        ensemble_score = signal["combined_score"]
+        logger.info(
+            f"[{symbol}] Precio: {current_price:.2f} | Score: {ensemble_score:.3f} "
+            f"(trend={signal['trend_score']}, mr={signal['mean_reversion_score']}, "
+            f"ml={signal['ml_score']}, adx={signal['adx']})"
+        )
 
         # 4. Evaluación de Entrada
-        if ensemble_score >= self.entry_threshold:
+        if signal["decision"] == "LONG":
             self._open_position(symbol=symbol, side="LONG", entry_price=current_price, atr=current_atr)
-        elif ensemble_score <= -self.entry_threshold:
+        elif signal["decision"] == "SHORT":
             self._open_position(symbol=symbol, side="SHORT", entry_price=current_price, atr=current_atr)
 
-    def calculate_ensemble_signal(self, current_row: pd.Series) -> float:
+    def calculate_ensemble_signal(self, current_row: pd.Series) -> dict:
         """
-        Combina indicadores técnicos para generar una señal de -1.0 (Venta Fuerte) a 1.0 (Compra Fuerte).
+        Usa el motor de estrategias completo (strategies/ensemble.py):
+        tendencia (EMA/SMA/MACD normalizados por ATR) + reversión a la media
+        (RSI/Bollinger, con zona muerta) + filtro de régimen de mercado por ADX.
+
+        ml_prob_up=0.5 (neutro) porque WEIGHT_ML todavía está en 0.0 en config:
+        el modelo ML no está entrenado/cargado en vivo aún. Cuando se active,
+        acá se debe pasar la probabilidad real del modelo.
         """
-        score = 0.0
-
-        # 1. Extraer los valores calculados en la vela actual
-        # (Asegúrate de que indicators/technical.py genere estas columnas)
-        rsi = float(current_row.get("rsi", 50.0))
-        ema_fast = float(current_row.get("ema_fast", 0.0))
-        ema_slow = float(current_row.get("ema_slow", 0.0))
-
-        # 2. Estrategia 1: Tendencia (Cruce de EMAs)
-        trend_score = 0.0
-        if ema_fast > ema_slow and ema_slow > 0:
-            trend_score = 1.0   # Tendencia alcista
-        elif ema_fast < ema_slow and ema_slow > 0:
-            trend_score = -1.0  # Tendencia bajista
-
-        # 3. Estrategia 2: Reversión a la media (RSI)
-        reversion_score = 0.0
-        if rsi < 30:
-            reversion_score = 1.0   # Sobreventa extremo (señal de rebote alcista)
-        elif rsi > 70:
-            reversion_score = -1.0  # Sobrecompra extremo (señal de corrección bajista)
-
-        # 4. Obtener los pesos desde la configuración (config.py)
-        # Si no existen en config.py, usa 0.65 y 0.35 por defecto
-        weight_trend = getattr(config, "WEIGHT_TREND", 0.65)
-        weight_reversion = getattr(config, "WEIGHT_MEAN_REVERSION", 0.35)
-
-        # 5. Cálculo del Score Final ponderado
-        score = (trend_score * weight_trend) + (reversion_score * weight_reversion)
-
-        return score
+        return combined_signal(current_row, ml_prob_up=0.5)
 
     def _open_position(self, symbol: str, side: str, entry_price: float, atr: float):
         """Abre la posición y actualiza el diccionario del activo correspondiente."""
