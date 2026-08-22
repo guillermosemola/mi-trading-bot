@@ -6,9 +6,8 @@ para recibir klines en tiempo real con latencia mínima.
 import logging
 import asyncio
 import pandas as pd
-from binance.client import Client
 from binance.async_client import AsyncClient
-from binance.ws.spot_web_socket_api import SpotWebSocketAPIClient
+
 
 import config
 
