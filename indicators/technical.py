@@ -1,37 +1,51 @@
-"""
-Módulo de Indicadores Técnicos (indicators/technical.py).
-Calcula indicadores clave (EMA, ATR, RSI) sobre el DataFrame de velas.
+ódulo de Indicadores Técnicos (indicators/technical.py).
+Calcula el set completo de indicadores que consume el motor de estrategias
+(strategies/ensemble.py, trend_following.py, mean_reversion.py) sobre el
+DataFrame de velas en vivo.
+
+Usa la librería `ta`, la misma que usa features/feature_engineering.py en el
+backtester, para que la señal en vivo y la que se valida en backtest sean
+consistentes.
 """
 import pandas as pd
 import numpy as np
+import ta
 
 
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Enriquece el DataFrame con indicadores para el ensamble de estrategias."""
-    if df.empty or len(df) < 14:
+    """Enriquece el DataFrame con todos los indicadores que necesita el ensemble."""
+    # ADX/MACD/Bollinger necesitan más historial que el viejo mínimo de 14 velas
+    if df.empty or len(df) < 50:
         return df
 
     df = df.copy()
 
-    # 1. Medias Móviles Exponenciales (EMA)
-    df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
+    # 1. Medias móviles (para cruces normalizados por ATR)
+    df["sma_fast"] = ta.trend.sma_indicator(df["close"], window=10)
+    df["sma_slow"] = ta.trend.sma_indicator(df["close"], window=50)
+    df["ema_fast"] = ta.trend.ema_indicator(df["close"], window=12)
+    df["ema_slow"] = ta.trend.ema_indicator(df["close"], window=26)
     df["ema_trend"] = df["close"].ewm(span=200, adjust=False).mean()
 
-    # 2. Average True Range (ATR) para la gestión de riesgo
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift(1)).abs()
-    low_close = (df["low"] - df["close"].shift(1)).abs()
-    
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df["atr"] = tr.rolling(window=14).mean()
+    # Distancias entre medias (las usa strategies/trend_following.py)
+    df["sma_cross"] = df["sma_fast"] - df["sma_slow"]
+    df["ema_cross"] = df["ema_fast"] - df["ema_slow"]
 
-    # 3. Relative Strength Index (RSI)
-    delta = df["close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    
-    rs = gain / (loss + 1e-9)
-    df["rsi"] = 100 - (100 / (1 + rs))
+    # 2. Momentum
+    df["rsi"] = ta.momentum.rsi(df["close"], window=14)
+    macd = ta.trend.MACD(df["close"])
+    df["macd"] = macd.macd()
+    df["macd_signal"] = macd.macd_signal()
+    df["macd_diff"] = macd.macd_diff()
+
+    # 3. Volatilidad (ATR para riesgo, Bollinger para reversión a la media)
+    bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=2)
+    df["bb_high"] = bb.bollinger_hband()
+    df["bb_low"] = bb.bollinger_lband()
+    df["bb_pct"] = bb.bollinger_pband()
+    df["atr"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=14)
+
+    # 4. Fuerza de tendencia (filtro de régimen del ensemble: trend vs mean-reversion)
+    df["adx"] = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
 
     return df
