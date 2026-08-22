@@ -1,7 +1,6 @@
 """
-Módulo de Gestión de Portafolio (PortfolioManager) con Trailing Stop y Persistencia en Disco.
-Guarda y carga las posiciones abiertas en 'portfolio.json'.
-El Stop Loss sube automáticamente a medida que el precio alcance nuevos máximos (Trailing Stop).
+Módulo de Gestión de Portafolio (PortfolioManager) con Trailing Stop, 
+Persistencia y Sincronización Automática con Binance.
 """
 import json
 import logging
@@ -10,17 +9,24 @@ import config
 
 logger = logging.getLogger(__name__)
 
-PORTFOLIO_FILE = "portfolio.json"
+# En entornos como Render, usaremos /tmp si no existe una carpeta data persistente
+PORTFOLIO_FILE = os.getenv("PORTFOLIO_FILE_PATH", "/tmp/portfolio.json")
 
 
 class PortfolioManager:
-    def __init__(self):
+    def __init__(self, client=None):
         self.positions = {}
+        self.client = client
         self.load_state()
+        
+        # Si no hay posiciones en memoria local pero tenemos cliente de Binance, sincronizamos
+        if not self.positions and self.client:
+            self.sync_with_binance()
 
     def save_state(self):
         """Guarda las posiciones abiertas en un archivo JSON."""
         try:
+            os.makedirs(os.path.dirname(PORTFOLIO_FILE), exist_ok=True)
             with open(PORTFOLIO_FILE, "w") as f:
                 json.dump(self.positions, f, indent=4)
             logger.debug("Estado del portafolio guardado en %s", PORTFOLIO_FILE)
@@ -40,6 +46,53 @@ class PortfolioManager:
                 self.positions = {}
         else:
             self.positions = {}
+
+    def sync_with_binance(self):
+        """
+        Consulta la cuenta en Binance para detectar tenencias reales si el archivo local se perdió.
+        Reconstruye las posiciones con un Trailing Stop preventivo.
+        """
+        if not self.client:
+            return
+
+        logger.info("🔄 Sincronizando portafolio con la cuenta de Binance...")
+        try:
+            account_info = self.client.get_account()
+            balances = account_info.get("balances", [])
+
+            for bal in balances:
+                asset = bal["asset"]
+                free = float(bal["free"])
+                locked = float(bal["locked"])
+                total_qty = free + locked
+
+                # Ignoramos la moneda base (USDT) y montos insignificantes (polvo)
+                if asset == "USDT" or total_qty <= 0:
+                    continue
+
+                symbol = f"{asset}USDT"
+                if symbol in config.SYMBOLS and not self.has_position(symbol):
+                    # Obtenemos precio actual de mercado
+                    ticker = self.client.get_symbol_ticker(symbol=symbol)
+                    current_price = float(ticker["price"])
+
+                    # Definimos un Stop Loss de protección del 2% por debajo del precio actual
+                    fallback_sl = current_price * 0.98
+                    fallback_tp = current_price * 1.05
+
+                    logger.warning(
+                        "⚠️ Posición encontrada en Binance para %s (Qty: %.5f) sin registro local. Reconstruyendo...",
+                        symbol, total_qty
+                    )
+                    self.open_position(
+                        symbol=symbol,
+                        entry_price=current_price,
+                        quantity=total_qty,
+                        stop_loss=fallback_sl,
+                        take_profit=fallback_tp
+                    )
+        except Exception as e:
+            logger.error("Error al sincronizar posiciones con Binance: %s", e)
 
     def has_position(self, symbol: str) -> bool:
         """Devuelve True si existe una posición abierta en el símbolo."""
@@ -86,11 +139,9 @@ class PortfolioManager:
         highest = pos.get("highest_price", pos["entry_price"])
 
         # LÓGICA DE TRAILING STOP:
-        # Si alcanzamos un nuevo precio máximo en la posición
         if current_price > highest:
             delta = current_price - highest
             pos["highest_price"] = current_price
-            # Subimos el Stop Loss en la misma magnitud del incremento
             pos["stop_loss"] = sl + delta
             self.save_state()
             logger.info(
@@ -99,7 +150,7 @@ class PortfolioManager:
             )
             sl = pos["stop_loss"]
 
-        # 1. Verificar si tocó el Stop Loss (inicial o desplazado por Trailing Stop)
+        # 1. Verificar si tocó el Stop Loss
         if sl and current_price <= sl:
             return "TRAILING_STOP" if highest > pos["entry_price"] else "STOP_LOSS"
 
