@@ -27,7 +27,7 @@ class LiveDataFeed:
         api_secret = getattr(config, "BINANCE_API_SECRET", "")
         self.rest_client = Client(api_key, api_secret)
 
-    def fetch_historical_klines((self) -> pd.DataFrame:
+    def fetch_historical_klines(self) -> pd.DataFrame:
         """Descarga velas históricas vía REST API para inicializar indicadores."""
         logger.info(f"Descargando últimas {self.limit_history} velas ({self.interval}) para {self.symbol}...")
         try:
