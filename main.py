@@ -129,7 +129,7 @@ def cmd_run(poll_seconds: int = 60):
 
     client = get_client()
     executor = BinanceExecutor(client)
-    portfolio = PortfolioManager()
+    portfolio = PortfolioManager(client=client)
     risk_manager = RiskManager()
 
     models = {}
