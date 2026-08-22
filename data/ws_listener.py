@@ -7,6 +7,7 @@ import json
 import logging
 import websockets
 from data.live_feed import LiveDataFeed
+from indicators.technical import add_technical_indicators  # <-- IMPORTACIÓN AQUÍ
 
 logger = logging.getLogger(__name__)
 
@@ -28,15 +29,20 @@ async def start_kline_stream(bot_instance, symbol: str = "btcusdt", interval: st
                 message = await ws.recv()
                 data = json.loads(message)
                 
-                # Actualizar Dataframe con el mensaje
+                # Actualizar Dataframe con el mensaje de la vela
                 updated_df, is_closed = feed.update_candle_from_ws(data)
                 
                 # Evaluar mercado solo al cierre definitivo de la vela (evita falso ruido)
                 if is_closed:
-                    logger.info(f"📍 Vela {interval} cerrada. Evaluando estrategia...")
-                    # Calcular indicadores en el DF antes de evaluar
-                    # (aquí puedes invocar tus funciones de indicadores)
-                    current_row = updated_df.iloc[-1]
+                    logger.info(f"📍 Vela {interval} cerrada. Calculando indicadores y evaluando estrategia...")
+                    
+                    # 1. Calcular indicadores técnicos sobre el DataFrame completo
+                    df_with_indicators = add_technical_indicators(updated_df)
+                    
+                    # 2. Extraer la última fila (con todos los indicadores calculados)
+                    current_row = df_with_indicators.iloc[-1]
+                    
+                    # 3. Evaluar en el bot
                     bot_instance.evaluate_market(current_row)
 
             except Exception as e:
