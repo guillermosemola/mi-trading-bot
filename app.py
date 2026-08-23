@@ -1,3 +1,4 @@
+"""
 Servidor Web para mantener vivo el bot en Render (app.py)
 """
 import logging
