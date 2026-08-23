@@ -5,8 +5,8 @@ Gestiona la descarga de historiales y la conexión en vivo con Binance.
 import os
 import logging
 import pandas as pd
-from binance.client import Client  # <--- ESTA ES LA LÍNEA QUE FALTABA
-from strategies.indicators.technical import add_technical_indicators
+from binance.client import Client
+from indicators.technical import add_technical_indicators
 
 logger = logging.getLogger(__name__)
 
