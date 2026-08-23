@@ -21,6 +21,7 @@ class LiveDataFeed:
         
         # Inicializar el cliente REST de Binance para historiales
         self.rest_client = Client(api_key, api_secret)
+        self.df = self.fetch_historical_klines()
 
     def fetch_historical_klines(self) -> pd.DataFrame:
         """Descarga el historial reciente de velas para calcular los indicadores iniciales."""
@@ -51,3 +52,37 @@ class LiveDataFeed:
         except Exception as e:
             logger.error(f"[{self.symbol}] Error al obtener klines historicas: {e}")
             return pd.DataFrame()
+
+    def update_candle_from_ws(self, kline_data: dict) -> pd.DataFrame:
+        """Actualiza el DataFrame interno con los datos de la vela en curso provenientes del WebSocket."""
+        try:
+            # Extraer datos de la vela del mensaje de Binance WS
+            kline = kline_data.get('k', {})
+            open_time = pd.to_datetime(kline.get('t'), unit='ms')
+            o = float(kline.get('o', 0))
+            h = float(kline.get('h', 0))
+            l = float(kline.get('l', 0))
+            c = float(kline.get('c', 0))
+            v = float(kline.get('v', 0))
+            is_closed = kline.get('x', False)
+
+            if self.df.empty:
+                return self.df
+
+            # Si es la misma vela actual, actualizamos sus valores
+            if self.df.iloc[-1]['timestamp'] == open_time:
+                self.df.loc[self.df.index[-1], ['open', 'high', 'low', 'close', 'volume']] = [o, h, l, c, v]
+            elif is_closed:
+                # Si la vela anterior cerró, agregamos una nueva fila
+                new_row = pd.DataFrame([{
+                    'timestamp': open_time, 'open': o, 'high': h, 'low': l, 'close': c, 'volume': v
+                }])
+                self.df = pd.concat([self.df, new_row], ignore_index=True)
+
+            # Recalcular indicadores técnicos con la data actualizada
+            self.df = add_technical_indicators(self.df)
+            return self.df
+            
+        except Exception as e:
+            logger.error(f"[{self.symbol}] Error actualizando vela desde WS: {e}")
+            return self.df
