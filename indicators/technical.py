@@ -1,4 +1,3 @@
-=== 3. indicators/technical.py ===
 """
 Módulo de Indicadores Técnicos (indicators/technical.py).
 Calcula el set completo de indicadores que consume el motor de estrategias
@@ -51,18 +50,3 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["adx"] = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
 
     return df
-
-Mostrar data/live_feed.py final
-Resumen de qué pegar dónde (los 4 archivos de arriba, contenido completo, reemplazando cada uno entero):
-
-Archivo	Qué arregla
-app.py	Logging visible + conecta el cliente real de Binance
-main.py	Usa el ensemble completo (tendencia+reversión+ADX) en vez de la señal binaria
-indicators/technical.py	Calcula MACD, Bollinger, ADX, cruces — todo lo que el ensemble necesita
-data/live_feed.py	Arregla el bug de la tupla que rompía cada mensaje del websocket
-data/ws_listener.py no lo toqués, ya es compatible.
-
-Pegalos los 4 en una sola tanda (con el lápiz ✏️, uno por uno, "Commit changes" en cada uno) antes de que dispares el deploy final — si Render hace un deploy a mitad de camino con solo alguno de los 4 actualizado, puede volver a romperse por incompatibilidad entre archivos, como pasó recién. Avisame cuando termines los 4 y reviso el deploy y los primeros logs en tiempo real.
-
-
-
