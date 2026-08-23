@@ -53,8 +53,15 @@ class LiveDataFeed:
             logger.error(f"[{self.symbol}] Error al obtener klines historicas: {e}")
             return pd.DataFrame()
 
-    def update_candle_from_ws(self, kline_data: dict) -> pd.DataFrame:
-        """Actualiza el DataFrame interno con los datos de la vela en curso provenientes del WebSocket."""
+    def update_candle_from_ws(self, kline_data: dict):
+        """
+        Actualiza el DataFrame interno con los datos de la vela en curso
+        provenientes del WebSocket.
+
+        Devuelve (df, is_closed): ws_listener.py hace
+        `updated_df, is_closed = feed.update_candle_from_ws(data)`, asi que
+        SIEMPRE hay que devolver la tupla, no solo el DataFrame.
+        """
         try:
             # Extraer datos de la vela del mensaje de Binance WS
             kline = kline_data.get('k', {})
@@ -67,22 +74,22 @@ class LiveDataFeed:
             is_closed = kline.get('x', False)
 
             if self.df.empty:
-                return self.df
+                return self.df, is_closed
 
             # Si es la misma vela actual, actualizamos sus valores
             if self.df.iloc[-1]['timestamp'] == open_time:
                 self.df.loc[self.df.index[-1], ['open', 'high', 'low', 'close', 'volume']] = [o, h, l, c, v]
             elif is_closed:
-                # Si la vela anterior cerró, agregamos una nueva fila
+                # Si la vela anterior cerro, agregamos una nueva fila
                 new_row = pd.DataFrame([{
                     'timestamp': open_time, 'open': o, 'high': h, 'low': l, 'close': c, 'volume': v
                 }])
                 self.df = pd.concat([self.df, new_row], ignore_index=True)
 
-            # Recalcular indicadores técnicos con la data actualizada
+            # Recalcular indicadores tecnicos con la data actualizada
             self.df = add_technical_indicators(self.df)
-            return self.df
-            
+            return self.df, is_closed
+
         except Exception as e:
             logger.error(f"[{self.symbol}] Error actualizando vela desde WS: {e}")
-            return self.df
+            return self.df, False
