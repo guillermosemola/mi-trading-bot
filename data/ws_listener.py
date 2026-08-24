@@ -16,10 +16,8 @@ async def start_multi_stream(bot_instance, symbols: list, interval: str = "1m"):
     """
     Abre una única conexión WebSocket combinada para todos los símbolos configurados.
     """
-    # 1. Inicializar los feeds de datos históricos para cada símbolo
     feeds = {symbol.upper(): LiveDataFeed(symbol=symbol, interval=interval) for symbol in symbols}
 
-    # 2. Construir la URL del Combined Stream
     streams_str = "/".join([f"{s.lower()}@kline_{interval}" for s in symbols])
     ws_url = f"wss://stream.binance.com:9443/stream?streams={streams_str}"
 
@@ -28,7 +26,7 @@ async def start_multi_stream(bot_instance, symbols: list, interval: str = "1m"):
             logger.info(f"Conectando al Stream Combinado de Binance para {len(symbols)} activos...")
             
             async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as ws:
-                logger.info("🟢 Stream Combinado conectado exitosamente.")
+                logger.info("🟢 Stream Combinado conectado exitosamente. Monitoreando mercado...")
                 
                 while True:
                     message = await ws.recv()
@@ -43,12 +41,17 @@ async def start_multi_stream(bot_instance, symbols: list, interval: str = "1m"):
                         continue
                         
                     symbol = payload.get("s", "").upper()
+                    close_price = kline.get("c")
                     is_closed = kline.get("x", False)
                     
+                    # LOG DE MONITOREO: Te confirma que el bot está procesando precios segundo a segundo
+                    logger.info(f"🔍 [{symbol}] Precio en vivo: {close_price} | Vela cerrada: {is_closed}")
+
                     if symbol in feeds:
                         updated_df = feeds[symbol].update_candle_from_ws(payload)
                         
                         if is_closed and not updated_df.empty:
+                            logger.info(f"🚨 ¡Vela cerrada detectada para {symbol}! Evaluando estrategia...")
                             current_row = updated_df.iloc[-1]
                             bot_instance.evaluate_market(symbol, current_row)
 
