@@ -51,10 +51,13 @@ class LiveDataFeed:
             logger.error(f"[{self.symbol}] Error al obtener klines historicas: {e}")
             return pd.DataFrame()
 
-    def update_candle_from_ws(self, kline_data: dict):
+    def update_candle_from_ws(self, kline_data: dict) -> pd.DataFrame:
         """
         Actualiza el DataFrame interno con los datos de la vela del WebSocket.
-        Devuelve una tupla: (DataFrame actualizado, booleano indicando si la vela cerró).
+
+        Devuelve SOLO el DataFrame (no una tupla): ws_listener.py (Stream
+        Combinado) hace `updated_df = feeds[symbol].update_candle_from_ws(payload)`
+        y calcula `is_closed` el mismo, leyendo `payload["k"]["x"]` directamente.
         """
         try:
             kline = kline_data.get('k', {})
@@ -67,7 +70,7 @@ class LiveDataFeed:
             is_closed = kline.get('x', False)
 
             if self.df.empty:
-                return self.df, is_closed
+                return self.df
 
             if self.df.iloc[-1]['timestamp'] == open_time:
                 self.df.loc[self.df.index[-1], ['open', 'high', 'low', 'close', 'volume']] = [o, h, l, c, v]
@@ -78,8 +81,9 @@ class LiveDataFeed:
                 self.df = pd.concat([self.df, new_row], ignore_index=True)
 
             self.df = add_technical_indicators(self.df)
-            return self.df, is_closed
-            
+            return self.df
+
         except Exception as e:
             logger.error(f"[{self.symbol}] Error actualizando vela desde WS: {e}")
-            return self.df, False
+            return self.df
+Resumen de qué pasaba y qué arreglé:
