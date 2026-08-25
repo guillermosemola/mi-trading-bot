@@ -10,6 +10,7 @@ from indicators.technical import add_technical_indicators
 
 logger = logging.getLogger(__name__)
 
+
 class LiveDataFeed:
     def __init__(self, symbol: str, interval: str = "1m"):
         self.symbol = symbol.upper()
@@ -19,12 +20,12 @@ class LiveDataFeed:
         api_key = os.getenv("BINANCE_API_KEY", "")
         api_secret = os.getenv("BINANCE_API_SECRET", "")
         
-        # Inicializar el cliente REST de Binance para historiales
+        # Inicializar cliente de Binance
         self.rest_client = Client(api_key, api_secret)
         self.df = self.fetch_historical_klines()
 
     def fetch_historical_klines(self) -> pd.DataFrame:
-        """Descarga el historial reciente de velas para calcular los indicadores iniciales."""
+        """Descarga el historial reciente de velas para calcular indicadores iniciales."""
         try:
             klines = self.rest_client.get_klines(
                 symbol=self.symbol,
@@ -48,16 +49,13 @@ class LiveDataFeed:
             return df
             
         except Exception as e:
-            logger.error(f"[{self.symbol}] Error al obtener klines historicas: {e}")
+            logger.error(f"[{self.symbol}] Error al obtener klines históricas: {e}")
             return pd.DataFrame()
 
-    def update_candle_from_ws(self, kline_data: dict) -> pd.DataFrame:
+    def update_candle_from_ws(self, kline_data: dict):
         """
         Actualiza el DataFrame interno con los datos de la vela del WebSocket.
-
-        Devuelve SOLO el DataFrame (no una tupla): ws_listener.py (Stream
-        Combinado) hace `updated_df = feeds[symbol].update_candle_from_ws(payload)`
-        y calcula `is_closed` el mismo, leyendo `payload["k"]["x"]` directamente.
+        Devuelve una tupla: (DataFrame actualizado, booleano indicando si la vela cerró).
         """
         try:
             kline = kline_data.get('k', {})
@@ -70,7 +68,7 @@ class LiveDataFeed:
             is_closed = kline.get('x', False)
 
             if self.df.empty:
-                return self.df
+                return self.df, is_closed
 
             if self.df.iloc[-1]['timestamp'] == open_time:
                 self.df.loc[self.df.index[-1], ['open', 'high', 'low', 'close', 'volume']] = [o, h, l, c, v]
@@ -81,9 +79,8 @@ class LiveDataFeed:
                 self.df = pd.concat([self.df, new_row], ignore_index=True)
 
             self.df = add_technical_indicators(self.df)
-            return self.df
-
+            return self.df, is_closed
+            
         except Exception as e:
             logger.error(f"[{self.symbol}] Error actualizando vela desde WS: {e}")
-            return self.df
-Resumen de qué pasaba y qué arreglé:
+            return self.df, False
