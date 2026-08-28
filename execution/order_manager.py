@@ -1,13 +1,16 @@
 """
 Módulo de Ejecución de Órdenes (execution/order_manager.py)
 Administra la ejecución en Binance con soporte para DRY_RUN,
-formateo dinámico de LOT_SIZE y órdenes Límite Adaptativas (Maker/Taker).
+formateo dinámico (LOT_SIZE, PRICE_FILTER), prevención de desfase de reloj (recvWindow)
+y órdenes Límite Adaptativas (Maker/Taker).
 """
 import logging
 import time
 import math
+from decimal import Decimal
 import config
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
 
 logger = logging.getLogger(__name__)
 
@@ -18,32 +21,48 @@ class OrderManager:
         self.timeout_seconds = timeout_seconds
         self.max_spread_pct = max_spread_pct
         self.dry_run = getattr(config, "DRY_RUN", True)
+        self._rules_cache = {}
 
-    def _get_step_size_and_precision(self, symbol: str) -> tuple[float, int]:
-        """Obtiene el stepSize del símbolo en Binance para evitar errores LOT_SIZE."""
+    def _get_symbol_filters(self, symbol: str) -> tuple[float, int, float, int]:
+        """Obtiene y almacena en caché las reglas de precisión (LOT_SIZE y PRICE_FILTER)."""
+        if symbol in self._rules_cache:
+            return self._rules_cache[symbol]
+
+        default_rules = (0.00001, 5, 0.01, 2)
         if not self.client or self.dry_run:
-            return 0.00001, 5  # Precisión por defecto en Dry Run
+            return default_rules
 
         try:
             info = self.client.get_symbol_info(symbol)
+            step_size, qty_precision = 0.00001, 5
+            tick_size, price_precision = 0.01, 2
+
             for f in info.get("filters", []):
                 if f["filterType"] == "LOT_SIZE":
                     step_size = float(f["stepSize"])
-                    precision = max(0, str(step_size)[::-1].find("."))
-                    return step_size, precision
-        except Exception as e:
-            logger.warning(f"No se pudo consultar LOT_SIZE para {symbol}: {e}")
-        
-        return 0.00001, 5
+                    qty_precision = Decimal(f["stepSize"]).normalize().as_tuple().exponent * -1
+                elif f["filterType"] == "PRICE_FILTER":
+                    tick_size = float(f["tickSize"])
+                    price_precision = Decimal(f["tickSize"]).normalize().as_tuple().exponent * -1
 
-    def _round_qty(self, symbol: str, quantity: float) -> float:
-        """Ajusta la cantidad al múltiplo exacto permitido por Binance."""
-        step_size, precision = self._get_step_size_and_precision(symbol)
-        if step_size > 0:
-            # Redondeo hacia abajo para evitar pedir más de lo que se tiene en balance
-            factor = 1 / step_size
-            return round(math.floor(quantity * factor) / factor, precision)
-        return round(quantity, precision)
+            rules = (step_size, max(0, qty_precision), tick_size, max(0, price_precision))
+            self._rules_cache[symbol] = rules
+            return rules
+        except Exception as e:
+            logger.warning(f"Error consultando filtros Binance para {symbol}: {e}")
+            return default_rules
+
+    def _format_qty_and_price(self, symbol: str, quantity: float, price: float) -> tuple[str, str]:
+        """Ajusta cantidad y precio según las reglas estrictas de Binance."""
+        step_size, qty_prec, tick_size, price_prec = self._get_symbol_filters(symbol)
+        
+        factor_qty = 1 / step_size
+        rounded_qty = math.floor(quantity * factor_qty) / factor_qty
+        
+        factor_price = 1 / tick_size
+        rounded_price = round(price * factor_price) / factor_price
+
+        return f"{rounded_qty:.{qty_prec}f}", f"{rounded_price:.{price_prec}f}"
 
     def check_spread_ok(self, bid: float, ask: float) -> bool:
         """Verifica que el spread no supere el umbral seguro."""
@@ -61,7 +80,10 @@ class OrderManager:
         1. Si DRY_RUN es True: Simula la operación sin tocar la API real.
         2. Si DRY_RUN es False: Ejecuta una orden Límite Maker con fallback a Mercado Taker.
         """
-        formatted_qty = self._round_qty(symbol, qty)
+        limit_price = current_bid if side in ["BUY", "LONG"] else current_ask
+        str_qty, str_price = self._format_qty_and_price(symbol, qty, limit_price)
+        formatted_qty = float(str_qty)
+
         if formatted_qty <= 0:
             logger.error(f"Cantidad ajustada a 0 para {symbol}, cancelación de orden.")
             return {"status": "CANCELLED", "reason": "ZERO_QTY", "filled_price": 0.0, "qty": 0.0}
@@ -69,54 +91,74 @@ class OrderManager:
         if not self.check_spread_ok(current_bid, current_ask):
             return {"status": "CANCELLED", "reason": "HIGH_SPREAD", "filled_price": 0.0, "qty": 0.0}
 
-        limit_price = current_bid if side in ["BUY", "LONG"] else current_ask
-
-        # Modo DRY_RUN (Simulación local)
+        # Modo DRY_RUN (Simulación)
         if self.dry_run or self.client is None:
-            logger.info(f"🧪 [DRY_RUN] Orden {side} simulada: {formatted_qty} {symbol} a {limit_price:.2f}")
+            logger.info(f"🧪 [DRY_RUN] Orden {side} simulada: {str_qty} {symbol} a {str_price}")
             return {
                 "status": "FILLED",
                 "type": "DRY_RUN_MAKER",
-                "filled_price": limit_price,
+                "filled_price": float(str_price),
                 "qty": formatted_qty
             }
 
-        # Modo PRODUCCIÓN (Dinero Real o Testnet)
+        # Modo PRODUCCIÓN
         try:
             order_side = Client.SIDE_BUY if side in ["BUY", "LONG"] else Client.SIDE_SELL
             
-            logger.info(f"Colocando orden LÍMITE [{order_side}] {formatted_qty} {symbol} a {limit_price:.2f}...")
+            logger.info(f"Colocando orden LÍMITE [{order_side}] {str_qty} {symbol} a {str_price}...")
             order = self.client.create_order(
                 symbol=symbol,
                 side=order_side,
                 type=Client.ORDER_TYPE_LIMIT,
                 timeInForce=Client.TIME_IN_FORCE_GTC,
-                quantity=f"{formatted_qty}",
-                price=f"{limit_price:.2f}"
+                quantity=str_qty,
+                price=str_price,
+                recvWindow=10000
             )
             order_id = order["orderId"]
 
             # Esperar llenado como Maker
             start_time = time.time()
             while time.time() - start_time < self.timeout_seconds:
-                time.sleep(2)
-                check = self.client.get_order(symbol=symbol, orderId=order_id)
+                time.sleep(1.5)
+                check = self.client.get_order(symbol=symbol, orderId=order_id, recvWindow=10000)
                 if check["status"] == "FILLED":
-                    filled_price = float(check["price"])
-                    logger.info(f"✅ Orden LÍMITE ejecutada como MAKER a {filled_price:.2f}")
+                    filled_price = float(check.get("price") or str_price)
+                    logger.info(f"✅ Orden LÍMITE ejecutada como MAKER a {filled_price}")
+                    return {"status": "FILLED", "type": "LIMIT_MAKER", "filled_price": filled_price, "qty": formatted_qty}
+
+            # Cancelación con protección ante llenados de último segundo o errores de API
+            try:
+                self.client.cancel_order(symbol=symbol, orderId=order_id, recvWindow=10000)
+                time.sleep(0.5)
+                check_final = self.client.get_order(symbol=symbol, orderId=order_id, recvWindow=10000)
+                if check_final["status"] == "FILLED":
+                    filled_price = float(check_final.get("price") or str_price)
+                    return {"status": "FILLED", "type": "LIMIT_MAKER", "filled_price": filled_price, "qty": formatted_qty}
+            except BinanceAPIException as e:
+                if e.code == -2011:  # La orden ya fue llenada completamente y no puede cancelarse
+                    check_final = self.client.get_order(symbol=symbol, orderId=order_id, recvWindow=10000)
+                    filled_price = float(check_final.get("price") or str_price)
                     return {"status": "FILLED", "type": "LIMIT_MAKER", "filled_price": filled_price, "qty": formatted_qty}
 
             # Fallback a Mercado (Taker)
-            logger.warning(" Timeout en orden Límite. Cancelando y ejecutando a MERCADO (Taker)...")
-            self.client.cancel_order(symbol=symbol, orderId=order_id)
-
+            logger.warning("Timeout en orden Límite. Cancelada con éxito, ejecutando a MERCADO (Taker)...")
             market_order = self.client.create_order(
                 symbol=symbol,
                 side=order_side,
                 type=Client.ORDER_TYPE_MARKET,
-                quantity=f"{formatted_qty}"
+                quantity=str_qty,
+                recvWindow=10000
             )
-            filled_price = float(market_order.get("fills", [{}])[0].get("price", current_ask if order_side == "BUY" else current_bid))
+
+            # Cálculo del precio medio real (VWAP) en caso de ejecuciones parciales
+            fills = market_order.get("fills", [])
+            if fills:
+                total_cost = sum(float(f["price"]) * float(f["qty"]) for f in fills)
+                total_qty = sum(float(f["qty"]) for f in fills)
+                filled_price = total_cost / total_qty if total_qty > 0 else limit_price
+            else:
+                filled_price = limit_price
             
             return {"status": "FILLED", "type": "MARKET_TAKER", "filled_price": filled_price, "qty": formatted_qty}
 
